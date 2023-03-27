@@ -23,7 +23,7 @@ struct Status {
 
 /// The Uploader's responsibility is to perform work related to uploading.
 /// This includes: Making requests, handling requests, handling errors.
-final class TUSAPI {
+final class TUSAPI: NSObject {
     enum HTTPMethod: String {
         case head = "HEAD"
         case post = "POST"
@@ -32,10 +32,17 @@ final class TUSAPI {
         case delete = "DELETE"
     }
     
-    let session: URLSession
+    var session: URLSession!
+    private var backgroundHandler: (() -> Void)? = nil
 
     init(session: URLSession) {
+        super.init()
         self.session = session
+    }
+    
+    init(sessionConfiguration: URLSessionConfiguration) {
+        super.init()
+        self.session = URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: nil)
     }
     
     /// Fetch the status of an upload if an upload is not finished (e.g. interrupted).
@@ -46,6 +53,7 @@ final class TUSAPI {
     ///   - completion: A completion giving us the `Status` of an upload.
     @discardableResult
     func status(remoteDestination: URL, headers: [String: String]?, completion: @escaping (Result<Status, TUSAPIError>) -> Void) -> URLSessionDataTask {
+        print("DW: requesting status for \(remoteDestination)")
         let request = makeRequest(url: remoteDestination, method: .head, headers: headers ?? [:])
         let task = session.dataTask(request: request) { result in
             processResult(completion: completion) {
@@ -57,7 +65,7 @@ final class TUSAPI {
                       let offset = Int(offsetStr) else {
                           throw TUSAPIError.couldNotFetchStatus
                       }
-
+                print("DW: length \(length), offset \(offset)")
                 return Status(length: length, offset: offset)
             }
         }
@@ -187,6 +195,50 @@ final class TUSAPI {
         return task
     }
     
+    func upload(fromFile file: URL, offset: Int = 0, location: URL, metaData: UploadMetadata, completion: @escaping (Result<Int, TUSAPIError>) -> Void) -> URLSessionUploadTask {
+        let length: Int
+        if let fileAttributes = try? FileManager.default.attributesOfItem(atPath: file.path) {
+            if let bytes = fileAttributes[.size] as? Int64 {
+                length = Int(bytes)
+            } else {
+                length = 0
+            }
+        } else {
+            length = 0
+        }
+        
+        let headers = [
+            "Content-Type": "application/offset+octet-stream",
+            "Upload-Offset": String(offset),
+            "Content-Length": String(length)
+        ]
+        
+        print("DW: \(headers)")
+        
+        /// Attach all headers from customHeader property
+        let headersWithCustom = headers.merging(metaData.customHeaders ?? [:]) { _, new in new }
+        
+        let request = makeRequest(url: location, method: .patch, headers: headersWithCustom)
+        let task = session.uploadTask(with: request, fromFile: file) { result in
+            processResult(completion: completion) {
+                let (_, response) = try result.get()
+                
+                guard let offsetStr = response.allHeaderFields[caseInsensitive: "upload-offset"] as? String,
+                      let offset = Int(offsetStr) else {
+                    throw TUSAPIError.couldNotRetrieveOffset
+                }
+                return offset
+                
+            }
+        }
+        
+        return task
+    }
+    
+    func registerBackgroundHandler(_ handler: @escaping () -> Void) {
+        backgroundHandler = handler
+    }
+    
     /// A factory to make requests with sane defaults.
     /// - Parameters:
     ///   - url: The URL of the request.
@@ -245,3 +297,23 @@ extension Dictionary {
         return nil
     }
 }
+
+extension TUSAPI: URLSessionDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        print("DW: sent body data \(bytesSent). Total sent \(totalBytesSent)/\(totalBytesExpectedToSend). For task with id \(task.taskDescription).")
+    }
+    
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        print("DW: a task completed with \(error)")
+    }
+    
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        if let backgroundHandler {
+            DispatchQueue.main.async {
+                backgroundHandler()
+                self.backgroundHandler = nil
+            }
+        }
+    }
+}
+
